@@ -89,10 +89,7 @@ class Container:
 
     def has(self, item_id, qty):
         """判断容器内是否至少有 qty 个该物品。"""
-        slot = self.find(item_id)
-        if slot is None:
-            return False
-        return slot.stack.qty >= qty
+        return self.count(item_id) >= qty
 
     def free_units(self, item_id):
         """统计还能再放入多少个该物品。"""
@@ -114,16 +111,21 @@ class Container:
         if self.free_units(item_id) < qty:
             return False
         remaining = qty
+        limit = stack_limit(item_id)
         for slot in self.slots:
-            if slot.stack.item_id == item_id:
-                slot.stack.qty += remaining
-                remaining = 0
+            if remaining <= 0:
                 break
+            if slot.stack.item_id == item_id and not slot.is_empty():
+                space = min(slot.capacity, limit) - slot.stack.qty
+                if space > 0:
+                    take = min(space, remaining)
+                    slot.stack.qty += take
+                    remaining -= take
         for slot in self.slots:
             if remaining <= 0:
                 break
             if slot.is_empty():
-                take = min(slot.capacity, stack_limit(item_id), remaining)
+                take = min(slot.capacity, limit, remaining)
                 slot.stack = Stack(item_id, take)
                 remaining -= take
         return remaining == 0
@@ -134,8 +136,16 @@ class Container:
             raise ValueError("数量必须为正数")
         if not self.has(item_id, qty):
             return False
-        slot = self.find(item_id)
-        slot.stack.qty -= qty
+        remaining = qty
+        for slot in self.slots:
+            if remaining <= 0:
+                break
+            if slot.stack.item_id == item_id:
+                take = min(slot.stack.qty, remaining)
+                slot.stack.qty -= take
+                remaining -= take
+                if slot.stack.qty == 0:
+                    slot.stack = Stack()
         return True
 
     def split(self, index, qty):
@@ -143,6 +153,8 @@ class Container:
         slot = self.slots[index]
         if slot.is_empty():
             raise ValueError("该格没有可拆分的物品")
+        if qty <= 0 or qty >= slot.stack.qty:
+            raise ValueError("拆分数必须大于零且小于该格持有量")
         target = -1
         for i, candidate in enumerate(self.slots):
             if candidate.is_empty():
@@ -163,15 +175,18 @@ class Container:
         second = self.slots[j]
         if second.stack.qty > first.capacity:
             return False
+        if first.stack.qty > second.capacity:
+            return False
         first.stack, second.stack = second.stack, first.stack
         return True
 
     def compact(self):
         """把空格集中到容器末尾。"""
-        for i, slot in enumerate(self.slots):
-            if slot.is_empty():
-                del self.slots[i]
-                self.slots.append(Slot(slot.capacity))
+        non_empty = [slot for slot in self.slots if not slot.is_empty()]
+        empty = [slot for slot in self.slots if slot.is_empty()]
+        for slot in empty:
+            slot.stack = Stack()
+        self.slots = non_empty + empty
 
     # ---------- 容器之间 ----------
 
@@ -181,9 +196,15 @@ class Container:
             raise ValueError("数量必须为正数")
         if not self.has(item_id, qty):
             return False
+        if other.free_units(item_id) < qty:
+            return False
+        before_self = self.snapshot()
+        before_other = other.snapshot()
         if not self.remove_item(item_id, qty):
             return False
         if not other.add_item(item_id, qty):
+            self.restore(before_self)
+            other.restore(before_other)
             return False
         return True
 
@@ -221,9 +242,35 @@ def is_tradeable(stack):
     """判断堆叠能否参与交易。"""
     if stack.item_id is None or stack.qty <= 0:
         return False
-    if stack.bound and stack.durability >= MIN_TRADE_DURABILITY:
+    if stack.bound:
+        return False
+    if stack.durability < MIN_TRADE_DURABILITY:
         return False
     return True
+
+
+def _tradeable_units(container, item_id):
+    """统计容器内可交易的某物品数量。"""
+    return sum(
+        slot.stack.qty
+        for slot in container.slots
+        if slot.stack.item_id == item_id and is_tradeable(slot.stack)
+    )
+
+
+def _remove_tradeable(container, item_id, qty):
+    """只从可交易的堆叠中取出物品，返回是否全部取出。"""
+    remaining = qty
+    for slot in container.slots:
+        if remaining <= 0:
+            break
+        if slot.stack.item_id == item_id and is_tradeable(slot.stack):
+            take = min(slot.stack.qty, remaining)
+            slot.stack.qty -= take
+            remaining -= take
+            if slot.stack.qty == 0:
+                slot.stack = Stack()
+    return remaining == 0
 
 
 def trade(left, right, left_offer, right_offer):
@@ -235,18 +282,22 @@ def trade(left, right, left_offer, right_offer):
         for item_id, qty in offer:
             if qty <= 0:
                 raise ValueError("数量必须为正数")
-            if not container.has(item_id, qty):
+            if _tradeable_units(container, item_id) < qty:
                 return False
-            if not is_tradeable(container.find(item_id).stack):
+    before_left = left.snapshot()
+    before_right = right.snapshot()
+    for source, target, offer in ((left, right, left_offer), (right, left, right_offer)):
+        for item_id, qty in offer:
+            if target.free_units(item_id) < qty:
+                left.restore(before_left)
+                right.restore(before_right)
                 return False
-    for item_id, qty in left_offer:
-        if not left.remove_item(item_id, qty):
-            return False
-        if not right.add_item(item_id, qty):
-            return False
-    for item_id, qty in right_offer:
-        if not right.remove_item(item_id, qty):
-            return False
-        if not left.add_item(item_id, qty):
-            return False
+            if not _remove_tradeable(source, item_id, qty):
+                left.restore(before_left)
+                right.restore(before_right)
+                return False
+            if not target.add_item(item_id, qty):
+                left.restore(before_left)
+                right.restore(before_right)
+                return False
     return True
